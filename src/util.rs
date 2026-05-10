@@ -1,7 +1,19 @@
 use std::ffi::CString;
+use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// macOS quirk: posix_spawn(envp=NULL) reads from a snapshot taken at process start,
+// not the live `environ`. Setenv-after-launch updates aren't visible to the child.
+// Pass `*_NSGetEnviron()` explicitly so the child sees our HOME/USER/LOGNAME backfill.
+unsafe extern "C" {
+    fn _NSGetEnviron() -> *mut *mut *mut libc::c_char;
+}
+
+unsafe fn current_envp() -> *const *mut libc::c_char {
+    *_NSGetEnviron() as *const *mut libc::c_char
+}
 
 pub struct AppError {
     pub message: String,
@@ -242,7 +254,7 @@ pub fn spawn_unity(
             &actions,
             std::ptr::null(),
             argv.as_ptr() as *const *mut _,
-            std::ptr::null(),
+            current_envp(),
         );
         libc::posix_spawn_file_actions_destroy(&mut actions);
 
@@ -253,6 +265,57 @@ pub fn spawn_unity(
             });
         }
         Ok(pid)
+    }
+}
+
+// Spawn a command via raw posix_spawn (mimicking spawn_unity), capture stdout.
+// Used by the __debug-env test path to verify env inheritance through the same
+// code path Unity uses.
+pub fn spawn_capture(path: &Path, args: &[&str]) -> String {
+    use std::ffi::CString;
+    use std::io::Read;
+    let path_c = path_c(path);
+    let arg_cs: Vec<CString> = std::iter::once(path_c.clone())
+        .chain(args.iter().map(|a| CString::new(*a).expect("arg has no NULs")))
+        .collect();
+    let mut argv: Vec<*const libc::c_char> = arg_cs.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    unsafe {
+        let mut fds = [0i32; 2];
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return String::new();
+        }
+        let (rd, wr) = (fds[0], fds[1]);
+
+        let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
+        libc::posix_spawn_file_actions_init(&mut actions);
+        libc::posix_spawn_file_actions_adddup2(&mut actions, wr, libc::STDOUT_FILENO);
+        libc::posix_spawn_file_actions_addclose(&mut actions, rd);
+        libc::posix_spawn_file_actions_addclose(&mut actions, wr);
+
+        let mut pid: libc::pid_t = 0;
+        let r = libc::posix_spawn(
+            &mut pid,
+            path_c.as_ptr(),
+            &actions,
+            std::ptr::null(),
+            argv.as_ptr() as *const *mut _,
+            current_envp(),
+        );
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+        libc::close(wr);
+        if r != 0 {
+            libc::close(rd);
+            return String::new();
+        }
+
+        let mut file = std::fs::File::from_raw_fd(rd);
+        let mut buf = String::new();
+        let _ = file.read_to_string(&mut buf);
+        let mut status: libc::c_int = 0;
+        libc::waitpid(pid, &mut status, 0);
+        buf
     }
 }
 

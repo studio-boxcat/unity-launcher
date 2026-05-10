@@ -262,9 +262,14 @@ fn print_usage() {
 
 fn run(batchmode: bool) -> Result<(), AppError> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let project = project_path()?;
     let sub = args.iter().find(|a| !a.starts_with('-')).map(String::as_str);
 
+    // __debug-env doesn't need a project — keep it usable from a sparse-env test.
+    if let Some("__debug-env") = sub {
+        return cmd_debug_env();
+    }
+
+    let project = project_path()?;
     match sub {
         None | Some("launch") => cmd_launch(&project, batchmode),
         Some("focus") => cmd_focus(&project),
@@ -277,6 +282,24 @@ fn run(batchmode: bool) -> Result<(), AppError> {
             })
         }
     }
+}
+
+// Hidden test/diagnostic helper. Prints HOME as seen by:
+//  - the launcher itself (after ensure_user_env)
+//  - a child spawned via util::shell (zsh)
+//  - a child spawned via util::spawn_capture (raw posix_spawn — same code path as Unity)
+fn cmd_debug_env() -> Result<(), AppError> {
+    let self_home = env::var("HOME").unwrap_or_else(|_| "<unset>".into());
+    println!("self HOME={self_home}");
+
+    let r = util::shell("/usr/bin/printenv HOME", None);
+    let shell_home = r.output.trim();
+    println!("shell HOME={}", if shell_home.is_empty() { "<unset>" } else { shell_home });
+
+    let spawn_out = util::spawn_capture(Path::new("/usr/bin/printenv"), &["HOME"]);
+    let spawn_home = spawn_out.trim();
+    println!("spawn HOME={}", if spawn_home.is_empty() { "<unset>" } else { spawn_home });
+    Ok(())
 }
 
 fn main() -> ExitCode {
