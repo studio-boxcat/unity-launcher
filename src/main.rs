@@ -6,15 +6,11 @@ use std::process::ExitCode;
 use std::thread::sleep;
 use std::time::Duration;
 
+use util::{AppError, SpawnMode};
+
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PID_FILE: &str = "Temp/.unity-launcher.pid";
-
-#[derive(Debug)]
-struct AppError {
-    message: String,
-    detail: Option<String>,
-}
 
 fn show_error(e: &AppError, batchmode: bool) {
     eprintln!("Error: {}", e.message);
@@ -26,23 +22,34 @@ fn show_error(e: &AppError, batchmode: bool) {
     }
 }
 
-// Walk up from the executable looking for a Unity project marker.
+// Drop-in (`<project>/foo.app/Contents/MacOS/unity-launcher`) wins via the exe
+// path; `unity-launcher` from $PATH wins via the cwd fallback.
 fn project_path() -> Result<PathBuf, AppError> {
-    let exe = env::current_exe().map_err(|e| AppError {
-        message: "Could not resolve executable path".into(),
-        detail: Some(e.to_string()),
-    })?;
-    let mut p: &Path = &exe;
-    while let Some(parent) = p.parent() {
-        if parent.join("ProjectSettings/ProjectVersion.txt").exists() {
-            return Ok(parent.to_path_buf());
+    if let Ok(exe) = env::current_exe() {
+        if let Some(p) = walk_up_for_project(&exe) {
+            return Ok(p);
         }
-        p = parent;
+    }
+    if let Ok(cwd) = env::current_dir() {
+        if let Some(p) = walk_up_for_project(&cwd) {
+            return Ok(p);
+        }
+        if cwd.join("ProjectSettings/ProjectVersion.txt").exists() {
+            return Ok(cwd);
+        }
     }
     Err(AppError {
         message: "Not inside a Unity project".into(),
-        detail: Some("ProjectSettings/ProjectVersion.txt not found in any ancestor".into()),
+        detail: Some("ProjectSettings/ProjectVersion.txt not found in any ancestor of the executable or cwd".into()),
     })
+}
+
+fn walk_up_for_project(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .skip(1)
+        .find(|p| p.join("ProjectSettings/ProjectVersion.txt").exists())
+        .map(Path::to_path_buf)
 }
 
 fn unity_version(project: &Path) -> Result<String, AppError> {
@@ -53,30 +60,20 @@ fn unity_version(project: &Path) -> Result<String, AppError> {
     })?;
     contents
         .lines()
-        .find(|l| l.starts_with("m_EditorVersion:"))
-        .map(|l| l[16..].trim().to_string())
+        .find_map(|l| l.strip_prefix("m_EditorVersion:"))
+        .map(|v| v.trim().to_string())
         .ok_or(AppError {
             message: "Could not parse Unity version".into(),
             detail: Some("m_EditorVersion: line missing".into()),
         })
 }
 
-fn unity_path(ver: &str) -> Result<PathBuf, AppError> {
-    let p = PathBuf::from(format!(
+fn unity_path(ver: &str) -> PathBuf {
+    PathBuf::from(format!(
         "/Applications/Unity/Hub/Editor/{ver}/Unity.app/Contents/MacOS/Unity"
-    ));
-    if !p.exists() {
-        return Err(AppError {
-            message: format!("Unity {ver} not installed"),
-            detail: Some("Install via Unity Hub".into()),
-        });
-    }
-    Ok(p)
+    ))
 }
 
-// Resolve the running Unity PID for `project`. Tries the pid file first, then falls
-// back to a process scan — the file may be missing (Unity launched outside this tool)
-// or stale (Unity crashed without removing it).
 fn resolve_unity_pid(project: &Path) -> Option<libc::pid_t> {
     if let Ok(s) = std::fs::read_to_string(project.join(PID_FILE)) {
         if let Ok(pid) = s.trim().parse::<libc::pid_t>() {
@@ -101,7 +98,6 @@ fn clear_pid(project: &Path) {
     let _ = std::fs::remove_file(project.join(PID_FILE));
 }
 
-// Optional per-project hook: <project>/.unity-launcher/auth.sh
 fn run_auth(project: &Path) -> Result<bool, AppError> {
     let script = project.join(".unity-launcher/auth.sh");
     if !script.exists() {
@@ -115,8 +111,8 @@ fn run_auth(project: &Path) -> Result<bool, AppError> {
         let errors: Vec<String> = r
             .output
             .lines()
-            .filter(|l| l.starts_with("ERROR:"))
-            .map(|l| l[7..].trim().to_string())
+            .filter_map(|l| l.strip_prefix("ERROR:"))
+            .map(|m| m.trim().to_string())
             .collect();
         let message = errors.first().cloned().unwrap_or_else(|| "Auth hook failed".into());
         let detail = errors.get(1).cloned();
@@ -132,7 +128,8 @@ fn launch(unity: &Path, project: &Path, batchmode: bool) -> Result<bool, AppErro
 
     if batchmode {
         println!("Pairing -nographics with -batchmode");
-        let exit = util::spawn_unity_sync(unity, project, &log)?;
+        let pid = util::spawn_unity(unity, project, &log, SpawnMode::BatchSync)?;
+        let exit = util::waitpid_exit(pid);
         if exit != 0 {
             return Err(AppError {
                 message: format!("Unity batchmode exited {exit}"),
@@ -142,28 +139,28 @@ fn launch(unity: &Path, project: &Path, batchmode: bool) -> Result<bool, AppErro
         return Ok(true);
     }
 
-    let pid = util::spawn_unity_detached(unity, project, &log)?;
+    let pid = util::spawn_unity(unity, project, &log, SpawnMode::Detached)?;
     println!("Launching Unity (pid {pid})...");
     write_pid(project, pid);
 
     let iters = (STARTUP_TIMEOUT.as_millis() / POLL_INTERVAL.as_millis()) as usize;
     for _ in 0..iters {
         sleep(POLL_INTERVAL);
-        let Ok(c) = std::fs::read_to_string(&log) else {
+        let Ok(c) = std::fs::read_to_string(&log) else { continue };
+        if !c.contains("Licensing is initialized") {
             continue;
-        };
-
-        if c.contains("Licensing is initialized") {
-            if c.contains("Successfully updated license") {
-                println!("Unity started.");
-                return Ok(true);
-            }
-            println!("License error.");
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-            clear_pid(project);
-            return Ok(false);
         }
+        if c.contains("Successfully updated license") {
+            println!("Unity started.");
+            return Ok(true);
+        }
+        println!("License error.");
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        clear_pid(project);
+        return Ok(false);
     }
+    // License-init didn't appear within the budget. Treat as success — Unity may just
+    // be slow today and the user wants to keep using the editor.
     println!("Timeout.");
     Ok(true)
 }
@@ -174,10 +171,8 @@ fn cmd_launch(project: &Path, batchmode: bool) -> Result<(), AppError> {
     }
     println!("Project: {}", project.display());
 
-    let ver = unity_version(project)?;
-    println!("Unity: {ver}");
-    let unity = unity_path(&ver)?;
-
+    // Check for an already-running instance before doing the version/path lookups —
+    // those aren't needed on the fast path.
     if let Some(pid) = resolve_unity_pid(project) {
         if batchmode {
             return Err(AppError {
@@ -195,6 +190,12 @@ fn cmd_launch(project: &Path, batchmode: bool) -> Result<(), AppError> {
         return Ok(());
     }
 
+    let ver = unity_version(project)?;
+    println!("Unity: {ver}");
+    let unity = unity_path(&ver);
+
+    // Hot Reload (Unity asset) leaves CodePatcherCLI children running after a crashed
+    // editor; they hold ports/locks that block a clean re-launch.
     for pid in util::find_processes("CodePatcherCLI") {
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
@@ -222,7 +223,7 @@ fn cmd_launch(project: &Path, batchmode: bool) -> Result<(), AppError> {
     }
     println!("Relaunching...");
     let log = project.join(format!("Logs/unity-{}.log", util::timestamp()));
-    let pid = util::spawn_unity_detached(&unity, project, &log)?;
+    let pid = util::spawn_unity(&unity, project, &log, SpawnMode::Detached)?;
     write_pid(project, pid);
     Ok(())
 }
@@ -259,12 +260,9 @@ fn print_usage() {
     eprintln!("  quit             — send SIGTERM to the running Unity for this project");
 }
 
-fn run() -> Result<(), AppError> {
+fn run(batchmode: bool) -> Result<(), AppError> {
     let args: Vec<String> = env::args().skip(1).collect();
     let project = project_path()?;
-
-    // Parse subcommand. `-batchmode` is positional-agnostic for `launch`.
-    let batchmode = args.iter().any(|a| a == "-batchmode");
     let sub = args.iter().find(|a| !a.starts_with('-')).map(String::as_str);
 
     match sub {
@@ -283,7 +281,7 @@ fn run() -> Result<(), AppError> {
 
 fn main() -> ExitCode {
     let batchmode = env::args().any(|a| a == "-batchmode");
-    match run() {
+    match run(batchmode) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             show_error(&e, batchmode);

@@ -24,9 +24,17 @@ Rust toolchain.
 | `unity-launcher focus`      | Focus the running Unity for this project.                                 |
 | `unity-launcher quit`       | Send `SIGTERM` to the running Unity for this project.                     |
 
-The launcher locates the project by walking up from its own executable path
-looking for `ProjectSettings/ProjectVersion.txt` — drop the binary anywhere
-inside the project tree (raw at the root, or wrapped in a `.app`).
+The launcher locates the project by walking up from its own executable path,
+or — if the binary lives outside the project tree (e.g. on `$PATH`) — from the
+current working directory, looking for `ProjectSettings/ProjectVersion.txt`.
+So both of these work:
+
+- drop-in: `<project>/!unity.app/Contents/MacOS/unity-launcher`
+- from `$PATH`: `cd <project> && unity-launcher [focus|quit|...]`
+
+`quit` sends `SIGTERM` — Unity catches it and exits, but it isn't the same as
+a cmd-Q AppleEvent quit. If your project needs an in-editor "save then quit"
+hook, drive it through your own command channel.
 
 ## PID tracking
 

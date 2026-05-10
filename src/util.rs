@@ -3,12 +3,16 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub struct AppError {
+    pub message: String,
+    pub detail: Option<String>,
+}
+
 pub struct ShellResult {
     pub output: String,
     pub exit: i32,
 }
 
-// Synchronous shell, captures combined stdout+stderr. Used only for the auth hook.
 pub fn shell(cmd: &str, log: Option<&Path>) -> ShellResult {
     match Command::new("/bin/zsh").args(["-c", cmd]).output() {
         Ok(o) => {
@@ -27,6 +31,7 @@ pub fn shell(cmd: &str, log: Option<&Path>) -> ShellResult {
     }
 }
 
+// Hand-rolled to avoid pulling chrono/time for one timestamp string.
 pub fn timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -77,12 +82,12 @@ pub fn find_process(needle: &str) -> Option<libc::pid_t> {
 // token of the needle — drops the per-PID `KERN_PROCARGS2` sysctl from ~all-of-them
 // down to a handful, the difference between ~30ms and <1ms here.
 fn find_processes_impl(needle: &str, first_only: bool) -> Vec<libc::pid_t> {
-    let needle_lower = needle.to_lowercase();
     let comm_filter = needle
         .split_whitespace()
         .next()
         .unwrap_or(needle)
-        .to_lowercase();
+        .as_bytes();
+    let needle_bytes = needle.as_bytes();
 
     unsafe {
         let needed = libc::proc_listallpids(std::ptr::null_mut(), 0);
@@ -108,54 +113,33 @@ fn find_processes_impl(needle: &str, first_only: bool) -> Vec<libc::pid_t> {
                 continue;
             }
 
-            let n = libc::proc_name(
-                pid,
-                name_buf.as_mut_ptr() as *mut _,
-                name_buf.len() as u32,
-            );
+            let n = libc::proc_name(pid, name_buf.as_mut_ptr() as *mut _, name_buf.len() as u32);
             if n <= 0 {
                 continue;
             }
-            let name = std::str::from_utf8(&name_buf[..n as usize])
-                .unwrap_or("")
-                .to_lowercase();
-            if name != comm_filter {
+            if !name_buf[..n as usize].eq_ignore_ascii_case(comm_filter) {
                 continue;
             }
 
             let mut arg_mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
             let mut arg_size: libc::size_t = 0;
-            if libc::sysctl(
-                arg_mib.as_mut_ptr(),
-                3,
-                std::ptr::null_mut(),
-                &mut arg_size,
-                std::ptr::null_mut(),
-                0,
-            ) != 0
+            if libc::sysctl(arg_mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut arg_size, std::ptr::null_mut(), 0) != 0
                 || arg_size == 0
             {
                 continue;
             }
             let mut buf: Vec<u8> = vec![0; arg_size];
-            if libc::sysctl(
-                arg_mib.as_mut_ptr(),
-                3,
-                buf.as_mut_ptr() as *mut _,
-                &mut arg_size,
-                std::ptr::null_mut(),
-                0,
-            ) != 0
-            {
+            if libc::sysctl(arg_mib.as_mut_ptr(), 3, buf.as_mut_ptr() as *mut _, &mut arg_size, std::ptr::null_mut(), 0) != 0 {
                 continue;
             }
-            for j in 4..arg_size {
-                if buf[j] == 0 {
-                    buf[j] = b' ';
+            // Replace argv null separators with spaces so a substring search spans
+            // argv boundaries. The first 4 bytes are KERN_PROCARGS2's argc header.
+            for byte in &mut buf[4..arg_size] {
+                if *byte == 0 {
+                    *byte = b' ';
                 }
             }
-            let cmdline = String::from_utf8_lossy(&buf[4..arg_size]).to_lowercase();
-            if cmdline.contains(&needle_lower) {
+            if memmem_ci(&buf[4..arg_size], needle_bytes) {
                 matches.push(pid);
                 if first_only {
                     return matches;
@@ -166,7 +150,22 @@ fn find_processes_impl(needle: &str, first_only: bool) -> Vec<libc::pid_t> {
     }
 }
 
-// True if `pid` is a live process whose short name is "Unity".
+// ASCII case-insensitive substring search. Avoids allocating lowered-case copies.
+fn memmem_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    for window in haystack.windows(needle.len()) {
+        if window.eq_ignore_ascii_case(needle) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn is_unity_alive(pid: libc::pid_t) -> bool {
     if pid <= 0 {
         return false;
@@ -177,12 +176,7 @@ pub fn is_unity_alive(pid: libc::pid_t) -> bool {
         }
         let mut buf = [0u8; 32];
         let n = libc::proc_name(pid, buf.as_mut_ptr() as *mut _, buf.len() as u32);
-        if n <= 0 {
-            return false;
-        }
-        std::str::from_utf8(&buf[..n as usize])
-            .map(|s| s.eq_ignore_ascii_case("Unity"))
-            .unwrap_or(false)
+        n > 0 && buf[..n as usize].eq_ignore_ascii_case(b"Unity")
     }
 }
 
@@ -191,41 +185,22 @@ pub fn is_unity_alive(pid: libc::pid_t) -> bool {
 // Direct posix_spawn so we capture Unity's real PID (the shell-with-`&` approach
 // would give us the shell's PID instead). Unity reparents to launchd when we exit.
 
-pub fn spawn_unity_detached(
-    unity: &Path,
-    project: &Path,
-    log: &Path,
-) -> Result<libc::pid_t, super::AppError> {
-    spawn_unity(unity, project, log, false, true)
+pub enum SpawnMode {
+    /// Foreground editor: detach stdio so we can exit while Unity keeps running.
+    Detached,
+    /// Headless: inherit stdio, caller will waitpid.
+    BatchSync,
 }
 
-pub fn spawn_unity_sync(
+pub fn spawn_unity(
     unity: &Path,
     project: &Path,
     log: &Path,
-) -> Result<i32, super::AppError> {
-    let pid = spawn_unity(unity, project, log, true, false)?;
-    unsafe {
-        let mut status: libc::c_int = 0;
-        libc::waitpid(pid, &mut status, 0);
-        Ok(if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else {
-            -1
-        })
-    }
-}
-
-fn spawn_unity(
-    unity: &Path,
-    project: &Path,
-    log: &Path,
-    batchmode: bool,
-    detach_stdio: bool,
-) -> Result<libc::pid_t, super::AppError> {
-    let unity_c = path_c(unity)?;
-    let project_c = path_c(project)?;
-    let log_c = path_c(log)?;
+    mode: SpawnMode,
+) -> Result<libc::pid_t, AppError> {
+    let unity_c = path_c(unity);
+    let project_c = path_c(project);
+    let log_c = path_c(log);
 
     let mut argv_owned: Vec<CString> = vec![
         unity_c.clone(),
@@ -235,7 +210,7 @@ fn spawn_unity(
         c"-logFile".to_owned(),
         log_c,
     ];
-    if batchmode {
+    if matches!(mode, SpawnMode::BatchSync) {
         argv_owned.push(c"-batchmode".to_owned());
         argv_owned.push(c"-nographics".to_owned());
     }
@@ -245,22 +220,23 @@ fn spawn_unity(
     unsafe {
         // Unity reads MONO_CRASH_NOFILE — set in our env before spawn so it inherits.
         libc::setenv(c"MONO_CRASH_NOFILE".as_ptr(), c"1".as_ptr(), 1);
+        // When launched from Finder via a .app bundle, posix_spawn inherits a sparse
+        // environment that may lack HOME/USER/LOGNAME. Unity refuses to start without
+        // HOME, so backfill from the passwd database.
+        ensure_user_env();
 
         let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
         if libc::posix_spawn_file_actions_init(&mut actions) != 0 {
-            return Err(super::AppError {
+            return Err(AppError {
                 message: "posix_spawn_file_actions_init failed".into(),
                 detail: None,
             });
         }
-        if detach_stdio {
+        if matches!(mode, SpawnMode::Detached) {
             let devnull = c"/dev/null".as_ptr();
-            libc::posix_spawn_file_actions_addopen(
-                &mut actions, libc::STDIN_FILENO, devnull, libc::O_RDONLY, 0);
-            libc::posix_spawn_file_actions_addopen(
-                &mut actions, libc::STDOUT_FILENO, devnull, libc::O_WRONLY, 0);
-            libc::posix_spawn_file_actions_addopen(
-                &mut actions, libc::STDERR_FILENO, devnull, libc::O_WRONLY, 0);
+            libc::posix_spawn_file_actions_addopen(&mut actions, libc::STDIN_FILENO, devnull, libc::O_RDONLY, 0);
+            libc::posix_spawn_file_actions_addopen(&mut actions, libc::STDOUT_FILENO, devnull, libc::O_WRONLY, 0);
+            libc::posix_spawn_file_actions_addopen(&mut actions, libc::STDERR_FILENO, devnull, libc::O_WRONLY, 0);
         }
 
         let mut pid: libc::pid_t = 0;
@@ -275,7 +251,7 @@ fn spawn_unity(
         libc::posix_spawn_file_actions_destroy(&mut actions);
 
         if r != 0 {
-            return Err(super::AppError {
+            return Err(AppError {
                 message: "Failed to spawn Unity".into(),
                 detail: Some(format!("posix_spawn returned {r}")),
             });
@@ -284,15 +260,40 @@ fn spawn_unity(
     }
 }
 
-fn path_c(p: &Path) -> Result<CString, super::AppError> {
-    let s = p.to_str().ok_or(super::AppError {
-        message: "Path is not valid UTF-8".into(),
-        detail: Some(p.display().to_string()),
-    })?;
-    CString::new(s).map_err(|_| super::AppError {
-        message: "Path contains a NUL byte".into(),
-        detail: Some(p.display().to_string()),
-    })
+pub fn waitpid_exit(pid: libc::pid_t) -> i32 {
+    unsafe {
+        let mut status: libc::c_int = 0;
+        libc::waitpid(pid, &mut status, 0);
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        }
+    }
+}
+
+fn path_c(p: &Path) -> CString {
+    let s = p.to_str().expect("path is valid UTF-8");
+    CString::new(s).expect("path contains no NUL byte")
+}
+
+unsafe fn ensure_user_env() {
+    let needs = [c"HOME".as_ptr(), c"USER".as_ptr(), c"LOGNAME".as_ptr()];
+    if needs.iter().all(|k| !libc::getenv(*k).is_null()) {
+        return;
+    }
+    let pw = libc::getpwuid(libc::getuid());
+    if pw.is_null() {
+        return;
+    }
+    let set_if_missing = |key: *const libc::c_char, val: *const libc::c_char| {
+        if !val.is_null() && libc::getenv(key).is_null() {
+            libc::setenv(key, val, 1);
+        }
+    };
+    set_if_missing(c"HOME".as_ptr(), (*pw).pw_dir);
+    set_if_missing(c"USER".as_ptr(), (*pw).pw_name);
+    set_if_missing(c"LOGNAME".as_ptr(), (*pw).pw_name);
 }
 
 // MARK: Activation
@@ -310,7 +311,7 @@ pub fn focus_process(pid: libc::pid_t) {
     unsafe {
         let f = libc::fork();
         if f != 0 {
-            return; // parent (or fork failed)
+            return;
         }
 
         let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
