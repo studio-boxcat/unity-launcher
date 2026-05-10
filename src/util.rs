@@ -220,10 +220,6 @@ pub fn spawn_unity(
     unsafe {
         // Unity reads MONO_CRASH_NOFILE — set in our env before spawn so it inherits.
         libc::setenv(c"MONO_CRASH_NOFILE".as_ptr(), c"1".as_ptr(), 1);
-        // When launched from Finder via a .app bundle, posix_spawn inherits a sparse
-        // environment that may lack HOME/USER/LOGNAME. Unity refuses to start without
-        // HOME, so backfill from the passwd database.
-        ensure_user_env();
 
         let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
         if libc::posix_spawn_file_actions_init(&mut actions) != 0 {
@@ -277,7 +273,10 @@ fn path_c(p: &Path) -> CString {
     CString::new(s).expect("path contains no NUL byte")
 }
 
-unsafe fn ensure_user_env() {
+// Backfill HOME/USER/LOGNAME from the passwd database when missing — Finder-launched
+// .app bundles get a sparse environment, and Unity (and anything else we shell out to)
+// refuses to run without HOME. Call once at startup so every child inherits.
+pub unsafe fn ensure_user_env() {
     let needs = [c"HOME".as_ptr(), c"USER".as_ptr(), c"LOGNAME".as_ptr()];
     if needs.iter().all(|k| !libc::getenv(*k).is_null()) {
         return;

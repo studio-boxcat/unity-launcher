@@ -280,6 +280,7 @@ fn run(batchmode: bool) -> Result<(), AppError> {
 }
 
 fn main() -> ExitCode {
+    unsafe { util::ensure_user_env() };
     let batchmode = env::args().any(|a| a == "-batchmode");
     match run(batchmode) {
         Ok(()) => ExitCode::SUCCESS,
