@@ -48,7 +48,7 @@ tool, or crashed), it falls back to a process scan.
 On license-init failure during launch, the launcher checks for
 `<project>/.unity-launcher/auth.sh`. If present, it runs (capturing output to
 `<project>/Logs/unity-auth-*.log`) and then relaunches Unity. Lines beginning
-with `ERROR:` are surfaced in the failure dialog.
+with `ERROR:` are surfaced in the launcher's error output.
 
 ## Profile
 

@@ -12,12 +12,13 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PID_FILE: &str = "Temp/.unity-launcher.pid";
 
-fn show_error(e: &AppError, batchmode: bool) {
+// Headless by default; opt in to the macOS alert via UNITY_LAUNCHER_GUI=1.
+fn show_error(e: &AppError) {
     eprintln!("Error: {}", e.message);
     if let Some(d) = &e.detail {
         eprintln!("  {d}");
     }
-    if !batchmode {
+    if env::var_os("UNITY_LAUNCHER_GUI").is_some() {
         util::show_alert(&e.message, e.detail.as_deref().unwrap_or(""));
     }
 }
@@ -308,7 +309,7 @@ fn main() -> ExitCode {
     match run(batchmode) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            show_error(&e, batchmode);
+            show_error(&e);
             ExitCode::FAILURE
         }
     }
