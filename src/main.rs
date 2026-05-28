@@ -27,34 +27,22 @@ fn show_error(e: &AppError) {
     }
 }
 
-// Drop-in (`<project>/foo.app/Contents/MacOS/unity-launcher`) wins via the exe
-// path; `unity-launcher` from $PATH wins via the cwd fallback.
+// Drop-in (`<project>/foo.app/Contents/MacOS/unity-launcher`) resolves via the exe
+// path; `unity-launcher` from $PATH falls back to cwd.
 fn project_path() -> Result<PathBuf, AppError> {
-    if let Ok(exe) = env::current_exe() {
-        if let Some(p) = walk_up_for_project(&exe) {
-            return Ok(p);
-        }
-    }
-    if let Ok(cwd) = env::current_dir() {
-        if let Some(p) = walk_up_for_project(&cwd) {
-            return Ok(p);
-        }
-        if cwd.join("ProjectSettings/ProjectVersion.txt").exists() {
-            return Ok(cwd);
-        }
-    }
-    Err(AppError {
-        message: "Not inside a Unity project".into(),
-        detail: Some("ProjectSettings/ProjectVersion.txt not found in any ancestor of the executable or cwd".into()),
-    })
-}
-
-fn walk_up_for_project(start: &Path) -> Option<PathBuf> {
-    start
-        .ancestors()
-        .skip(1)
-        .find(|p| p.join("ProjectSettings/ProjectVersion.txt").exists())
-        .map(Path::to_path_buf)
+    [env::current_exe().ok(), env::current_dir().ok()]
+        .into_iter()
+        .flatten()
+        .find_map(|start| {
+            start
+                .ancestors()
+                .find(|p| p.join("ProjectSettings/ProjectVersion.txt").exists())
+                .map(Path::to_path_buf)
+        })
+        .ok_or(AppError {
+            message: "Not inside a Unity project".into(),
+            detail: Some("ProjectSettings/ProjectVersion.txt not found in any ancestor of the executable or cwd".into()),
+        })
 }
 
 fn unity_version(project: &Path) -> Result<String, AppError> {
@@ -172,35 +160,44 @@ fn run_auth(project: &Path, unity: &Path) -> Result<bool, AppError> {
     Ok(true)
 }
 
-fn launch(unity: &Path, project: &Path, batchmode: bool) -> Result<bool, AppError> {
+fn prepare_log(project: &Path) -> PathBuf {
     let logs_dir = project.join("Logs");
     let _ = std::fs::create_dir_all(&logs_dir);
     prune_logs(&logs_dir, is_launch_log, KEEP_LAUNCH_LOGS);
     let log = logs_dir.join(format!("unity-{}.log", util::timestamp()));
     println!("Log: {}", log.display());
+    log
+}
 
-    if batchmode {
-        println!("Pairing -nographics with -batchmode");
-        let pid = util::spawn_unity(unity, project, &log, SpawnMode::BatchSync)?;
-        let exit = util::waitpid_exit(pid);
-        if exit != 0 {
-            return Err(AppError {
-                message: format!("Unity batchmode exited {exit}"),
-                detail: Some(format!("See {}", log.display())),
-            });
-        }
-        return Ok(true);
-    }
-
+fn start_unity_detached(unity: &Path, project: &Path) -> Result<(libc::pid_t, PathBuf), AppError> {
+    let log = prepare_log(project);
     let pid = util::spawn_unity(unity, project, &log, SpawnMode::Detached)?;
-    println!("Launching Unity (pid {pid})...");
     write_pid(project, pid);
+    Ok((pid, log))
+}
 
-    // Unity 6000.2.x stopped emitting "Licensing is initialized" on warm starts, so
-    // we key off "Successfully updated license" instead — confirmed present in the
-    // binary and on every recent launch. Process-death is the failure signal: if
-    // Unity exits before the success marker appears, treat it as license-init failure
-    // and trigger the auth hook (it'll fail cleanly if the cause is unrelated).
+fn launch_batchmode(unity: &Path, project: &Path) -> Result<(), AppError> {
+    println!("[BATCHMODE] Pairing -nographics with -batchmode");
+    let log = prepare_log(project);
+    let pid = util::spawn_unity(unity, project, &log, SpawnMode::BatchSync)?;
+    let exit = util::waitpid_exit(pid);
+    if exit != 0 {
+        return Err(AppError {
+            message: format!("Unity batchmode exited {exit}"),
+            detail: Some(format!("See {}", log.display())),
+        });
+    }
+    Ok(())
+}
+
+// Returns Ok(true) on success, Ok(false) on probable license failure (Unity exited
+// before the success marker), Err on spawn failure.
+fn launch(unity: &Path, project: &Path) -> Result<bool, AppError> {
+    let (pid, log) = start_unity_detached(unity, project)?;
+    println!("Launching Unity (pid {pid})...");
+
+    // Marker choice: Unity 6000.2.x omits "Licensing is initialized" on warm starts,
+    // but emits this success line on both warm and cold paths.
     let iters = (STARTUP_TIMEOUT.as_millis() / POLL_INTERVAL.as_millis()) as usize;
     for _ in 0..iters {
         sleep(POLL_INTERVAL);
@@ -220,13 +217,9 @@ fn launch(unity: &Path, project: &Path, batchmode: bool) -> Result<bool, AppErro
 }
 
 fn cmd_launch(project: &Path, batchmode: bool) -> Result<(), AppError> {
-    if batchmode {
-        println!("[BATCHMODE]");
-    }
     println!("Project: {}", project.display());
 
-    // Check for an already-running instance before doing the version/path lookups —
-    // those aren't needed on the fast path.
+    // Fast path before version/path lookups — those aren't needed if Unity is up.
     if let Some(pid) = resolve_unity_pid(project) {
         if batchmode {
             return Err(AppError {
@@ -254,21 +247,22 @@ fn cmd_launch(project: &Path, batchmode: bool) -> Result<(), AppError> {
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
 
-    if !batchmode {
-        // Suppress the "Recover Scenes?" modal after a crash.
-        let backup = project.join("Temp/__Backupscenes");
-        if backup.exists() {
-            let dest = project.join(format!("Temp/__Backupscenes.{}", util::timestamp()));
-            if let Err(e) = std::fs::rename(&backup, &dest) {
-                println!("Warning: failed to move scene backup: {e}");
-            }
+    if batchmode {
+        return launch_batchmode(&unity, project);
+    }
+
+    // Suppress the "Recover Scenes?" modal after a crash.
+    let backup = project.join("Temp/__Backupscenes");
+    if backup.exists() {
+        let dest = project.join(format!("Temp/__Backupscenes.{}", util::timestamp()));
+        if let Err(e) = std::fs::rename(&backup, &dest) {
+            println!("Warning: failed to move scene backup: {e}");
         }
     }
 
-    if launch(&unity, project, batchmode)? {
+    if launch(&unity, project)? {
         return Ok(());
     }
-
     if !run_auth(project, &unity)? {
         return Err(AppError {
             message: "Unity license error".into(),
@@ -276,11 +270,7 @@ fn cmd_launch(project: &Path, batchmode: bool) -> Result<(), AppError> {
         });
     }
     println!("Relaunching...");
-    let logs_dir = project.join("Logs");
-    prune_logs(&logs_dir, is_launch_log, KEEP_LAUNCH_LOGS);
-    let log = logs_dir.join(format!("unity-{}.log", util::timestamp()));
-    let pid = util::spawn_unity(&unity, project, &log, SpawnMode::Detached)?;
-    write_pid(project, pid);
+    start_unity_detached(&unity, project)?;
     Ok(())
 }
 
@@ -340,21 +330,15 @@ fn run(batchmode: bool) -> Result<(), AppError> {
     }
 }
 
-// Hidden test/diagnostic helper. Prints HOME as seen by:
-//  - the launcher itself (after ensure_user_env)
-//  - a child spawned via util::shell (zsh)
-//  - a child spawned via util::spawn_capture (raw posix_spawn — same code path as Unity)
+// Hidden diagnostic. Prints HOME as seen by the launcher itself (after ensure_user_env),
+// a zsh child (util::shell), and a raw posix_spawn child (same code path as Unity).
 fn cmd_debug_env() -> Result<(), AppError> {
-    let self_home = env::var("HOME").unwrap_or_else(|_| "<unset>".into());
-    println!("self HOME={self_home}");
-
-    let r = util::shell("/usr/bin/printenv HOME", None);
-    let shell_home = r.output.trim();
-    println!("shell HOME={}", if shell_home.is_empty() { "<unset>" } else { shell_home });
-
-    let spawn_out = util::spawn_capture(Path::new("/usr/bin/printenv"), &["HOME"]);
-    let spawn_home = spawn_out.trim();
-    println!("spawn HOME={}", if spawn_home.is_empty() { "<unset>" } else { spawn_home });
+    let show = |label: &str, val: &str| {
+        println!("{label} HOME={}", if val.is_empty() { "<unset>" } else { val });
+    };
+    show("self", &env::var("HOME").unwrap_or_default());
+    show("shell", util::shell("/usr/bin/printenv HOME", None).output.trim());
+    show("spawn", util::spawn_capture(Path::new("/usr/bin/printenv"), &["HOME"]).trim());
     Ok(())
 }
 
