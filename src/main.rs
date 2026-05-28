@@ -160,24 +160,21 @@ fn launch(unity: &Path, project: &Path, batchmode: bool) -> Result<bool, AppErro
     println!("Launching Unity (pid {pid})...");
     write_pid(project, pid);
 
+    // Unity 6000.2.x stopped emitting "Licensing is initialized" on warm starts (the
+    // license daemon was already running), so the prior gate never fired and launch
+    // always hit the 5s timeout. Key off "Successfully updated license" — confirmed
+    // present in the Unity binary and emitted on every recent launch. Side effect:
+    // no reliable failure marker remains, so this can no longer return Ok(false);
+    // run_auth is unreachable until we wire a process-death or error-pattern trigger.
     let iters = (STARTUP_TIMEOUT.as_millis() / POLL_INTERVAL.as_millis()) as usize;
     for _ in 0..iters {
         sleep(POLL_INTERVAL);
         let Ok(c) = std::fs::read_to_string(&log) else { continue };
-        if !c.contains("Licensing is initialized") {
-            continue;
-        }
         if c.contains("Successfully updated license") {
             println!("Unity started.");
             return Ok(true);
         }
-        println!("License error.");
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-        clear_pid(project);
-        return Ok(false);
     }
-    // License-init didn't appear within the budget. Treat as success — Unity may just
-    // be slow today and the user wants to keep using the editor.
     println!("Timeout.");
     Ok(true)
 }
