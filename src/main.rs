@@ -99,15 +99,31 @@ fn clear_pid(project: &Path) {
     let _ = std::fs::remove_file(project.join(PID_FILE));
 }
 
-fn run_auth(project: &Path) -> Result<bool, AppError> {
-    let script = project.join(".unity-launcher/auth.sh");
+// Machine-level hook at $XDG_CONFIG_HOME/unity-launcher/auth.sh (default ~/.config/...).
+// Symlink the version-controlled config/auth.sh into place via `just install-config`.
+fn auth_script_path() -> PathBuf {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+            home.join(".config")
+        });
+    base.join("unity-launcher/auth.sh")
+}
+
+fn run_auth(project: &Path, unity: &Path) -> Result<bool, AppError> {
+    let script = auth_script_path();
     if !script.exists() {
         return Ok(false);
     }
 
     println!("Running auth hook: {}", script.display());
     let log = project.join(format!("Logs/unity-auth-{}.log", util::timestamp()));
-    let r = util::shell(&format!("\"{}\"", script.display()), Some(&log));
+    // Single-quote paths; macOS Unity Hub paths contain no single quotes.
+    let r = util::shell(
+        &format!("UNITY='{}' '{}'", unity.display(), script.display()),
+        Some(&log),
+    );
     if r.exit != 0 {
         let errors: Vec<String> = r
             .output
@@ -216,10 +232,10 @@ fn cmd_launch(project: &Path, batchmode: bool) -> Result<(), AppError> {
         return Ok(());
     }
 
-    if !run_auth(project)? {
+    if !run_auth(project, &unity)? {
         return Err(AppError {
             message: "Unity license error".into(),
-            detail: Some("Check Unity Hub auth, or add a .unity-launcher/auth.sh hook".into()),
+            detail: Some("Check Unity Hub auth, or install ~/.config/unity-launcher/auth.sh (just install-config)".into()),
         });
     }
     println!("Relaunching...");

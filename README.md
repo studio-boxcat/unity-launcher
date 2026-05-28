@@ -46,9 +46,22 @@ tool, or crashed), it falls back to a process scan.
 ## Auth hook (optional)
 
 On license-init failure during launch, the launcher checks for
-`<project>/.unity-launcher/auth.sh`. If present, it runs (capturing output to
-`<project>/Logs/unity-auth-*.log`) and then relaunches Unity. Lines beginning
-with `ERROR:` are surfaced in the launcher's error output.
+`$XDG_CONFIG_HOME/unity-launcher/auth.sh` (default `~/.config/unity-launcher/auth.sh`).
+If present, it runs with `UNITY` set to the failing project's Unity binary path
+(output captured to `<project>/Logs/unity-auth-*.log`), then relaunches Unity.
+Lines beginning with `ERROR:` are surfaced in the launcher's error output.
+
+A reference hook lives at `config/auth.sh` in this repo. Install it with:
+
+```sh
+just install-config
+cp config/credentials.env.example ~/.config/unity-launcher/credentials.env
+# edit ~/.config/unity-launcher/credentials.env with USERNAME / PASSWORD / SERIAL_KEY
+```
+
+`credentials.env` sits next to the symlink (i.e. in `~/.config/unity-launcher/`),
+never in the repo. The hook resolves it via `$(dirname "$0")`, so the symlink
+location wins over the symlink target.
 
 ## Profile
 

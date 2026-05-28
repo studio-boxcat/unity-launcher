@@ -12,6 +12,15 @@ install: build
     ln -sf "{{justfile_directory()}}/bin/unity-launcher" ~/.local/bin/unity-launcher
     @echo "→ ~/.local/bin/unity-launcher"
 
+# Symlink ~/.config/unity-launcher/auth.sh → config/auth.sh.
+# credentials.env stays out of version control; populate it from credentials.env.example.
+install-config:
+    mkdir -p ~/.config/unity-launcher
+    ln -sf "{{justfile_directory()}}/config/auth.sh" ~/.config/unity-launcher/auth.sh
+    @echo "→ ~/.config/unity-launcher/auth.sh"
+    @test -f ~/.config/unity-launcher/credentials.env || \
+        echo "  (next: cp config/credentials.env.example ~/.config/unity-launcher/credentials.env, then edit)"
+
 # Project-specific: copy into meow-tower's !meow.app bundle
 install-meow: build
     cp bin/unity-launcher "$MEOW_CLIENT/!meow.app/Contents/MacOS/unity-launcher"
