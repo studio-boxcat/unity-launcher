@@ -11,6 +11,10 @@ use util::{AppError, SpawnMode};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PID_FILE: &str = "Temp/.unity-launcher.pid";
+// Per-project log retention. Each launch writes a fresh timestamped file; without a
+// cap they accumulate forever (10MB+ each is common). Auth runs are rare, so smaller.
+const KEEP_LAUNCH_LOGS: usize = 30;
+const KEEP_AUTH_LOGS: usize = 10;
 
 // Headless by default; opt in to the macOS alert via UNITY_LAUNCHER_GUI=1.
 fn show_error(e: &AppError) {
@@ -99,6 +103,34 @@ fn clear_pid(project: &Path) {
     let _ = std::fs::remove_file(project.join(PID_FILE));
 }
 
+// Closure-based matcher because "unity-" prefix overlaps "unity-auth-" — naive
+// starts_with would conflate the two log streams.
+fn prune_logs<F>(logs_dir: &Path, matches: F, keep: usize)
+where
+    F: Fn(&str) -> bool,
+{
+    let Ok(entries) = std::fs::read_dir(logs_dir) else { return };
+    let mut files: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| matches(&e.file_name().to_string_lossy()))
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+    for f in &files[..files.len() - keep] {
+        let _ = std::fs::remove_file(f.path());
+    }
+}
+
+fn is_launch_log(name: &str) -> bool {
+    name.starts_with("unity-") && !name.starts_with("unity-auth-") && name.ends_with(".log")
+}
+
+fn is_auth_log(name: &str) -> bool {
+    name.starts_with("unity-auth-") && name.ends_with(".log")
+}
+
 // Machine-level hook at $XDG_CONFIG_HOME/unity-launcher/auth.sh (default ~/.config/...).
 // Symlink the version-controlled config/auth.sh into place via `just install-config`.
 fn auth_script_path() -> PathBuf {
@@ -118,7 +150,9 @@ fn run_auth(project: &Path, unity: &Path) -> Result<bool, AppError> {
     }
 
     println!("Running auth hook: {}", script.display());
-    let log = project.join(format!("Logs/unity-auth-{}.log", util::timestamp()));
+    let logs_dir = project.join("Logs");
+    prune_logs(&logs_dir, is_auth_log, KEEP_AUTH_LOGS);
+    let log = logs_dir.join(format!("unity-auth-{}.log", util::timestamp()));
     // Single-quote paths; macOS Unity Hub paths contain no single quotes.
     let r = util::shell(
         &format!("UNITY='{}' '{}'", unity.display(), script.display()),
@@ -139,8 +173,10 @@ fn run_auth(project: &Path, unity: &Path) -> Result<bool, AppError> {
 }
 
 fn launch(unity: &Path, project: &Path, batchmode: bool) -> Result<bool, AppError> {
-    let log = project.join(format!("Logs/unity-{}.log", util::timestamp()));
-    let _ = std::fs::create_dir_all(project.join("Logs"));
+    let logs_dir = project.join("Logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+    prune_logs(&logs_dir, is_launch_log, KEEP_LAUNCH_LOGS);
+    let log = logs_dir.join(format!("unity-{}.log", util::timestamp()));
     println!("Log: {}", log.display());
 
     if batchmode {
@@ -160,12 +196,11 @@ fn launch(unity: &Path, project: &Path, batchmode: bool) -> Result<bool, AppErro
     println!("Launching Unity (pid {pid})...");
     write_pid(project, pid);
 
-    // Unity 6000.2.x stopped emitting "Licensing is initialized" on warm starts (the
-    // license daemon was already running), so the prior gate never fired and launch
-    // always hit the 5s timeout. Key off "Successfully updated license" — confirmed
-    // present in the Unity binary and emitted on every recent launch. Side effect:
-    // no reliable failure marker remains, so this can no longer return Ok(false);
-    // run_auth is unreachable until we wire a process-death or error-pattern trigger.
+    // Unity 6000.2.x stopped emitting "Licensing is initialized" on warm starts, so
+    // we key off "Successfully updated license" instead — confirmed present in the
+    // binary and on every recent launch. Process-death is the failure signal: if
+    // Unity exits before the success marker appears, treat it as license-init failure
+    // and trigger the auth hook (it'll fail cleanly if the cause is unrelated).
     let iters = (STARTUP_TIMEOUT.as_millis() / POLL_INTERVAL.as_millis()) as usize;
     for _ in 0..iters {
         sleep(POLL_INTERVAL);
@@ -173,6 +208,11 @@ fn launch(unity: &Path, project: &Path, batchmode: bool) -> Result<bool, AppErro
         if c.contains("Successfully updated license") {
             println!("Unity started.");
             return Ok(true);
+        }
+        if !util::is_unity_alive(pid) {
+            println!("Unity exited during startup.");
+            clear_pid(project);
+            return Ok(false);
         }
     }
     println!("Timeout.");
@@ -236,7 +276,9 @@ fn cmd_launch(project: &Path, batchmode: bool) -> Result<(), AppError> {
         });
     }
     println!("Relaunching...");
-    let log = project.join(format!("Logs/unity-{}.log", util::timestamp()));
+    let logs_dir = project.join("Logs");
+    prune_logs(&logs_dir, is_launch_log, KEEP_LAUNCH_LOGS);
+    let log = logs_dir.join(format!("unity-{}.log", util::timestamp()));
     let pid = util::spawn_unity(&unity, project, &log, SpawnMode::Detached)?;
     write_pid(project, pid);
     Ok(())
