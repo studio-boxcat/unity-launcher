@@ -1,6 +1,8 @@
-#!/bin/zsh
+#!/bin/zsh -f
 # Unity license recovery hook. Invoked by unity-launcher after a license-init failure.
 # Symlinked into ~/.config/unity-launcher/auth.sh by `just install-config`.
+# `-f` skips .zshenv so the user's shell config can't override $UNITY (or anything
+# else the launcher injects into the environment).
 #
 # Env from launcher:
 #   UNITY  — absolute path to the Unity binary for the failing project

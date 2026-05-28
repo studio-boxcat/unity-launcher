@@ -15,6 +15,7 @@ unsafe fn current_envp() -> *const *mut libc::c_char {
     *_NSGetEnviron() as *const *mut libc::c_char
 }
 
+#[derive(Debug)]
 pub struct AppError {
     pub message: String,
     pub detail: Option<String>,

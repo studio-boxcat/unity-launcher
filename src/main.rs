@@ -353,3 +353,151 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
+    struct Tempdir(PathBuf);
+    impl Tempdir {
+        fn new(label: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = env::temp_dir().join(format!(
+                "unity-launcher-test-{label}-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            Tempdir(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Tempdir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn touch_with_age(path: &Path, age_secs: u64) {
+        fs::write(path, b"").unwrap();
+        let when = SystemTime::now() - Duration::from_secs(age_secs);
+        let f = fs::File::open(path).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(when)).unwrap();
+    }
+
+    #[test]
+    fn is_launch_log_excludes_auth_and_other_logs() {
+        assert!(is_launch_log("unity-2026-05-28T06-55-40Z.log"));
+        assert!(!is_launch_log("unity-auth-2026-05-28T06-55-40Z.log"));
+        assert!(!is_launch_log("AssetImportWorker0.log"));
+        assert!(!is_launch_log("unity-2026.txt"));
+        assert!(!is_launch_log(".DS_Store"));
+    }
+
+    #[test]
+    fn is_auth_log_matches_only_auth_logs() {
+        assert!(is_auth_log("unity-auth-2026-05-28T06-55-40Z.log"));
+        assert!(!is_auth_log("unity-2026-05-28T06-55-40Z.log"));
+        assert!(!is_auth_log("auth.log"));
+    }
+
+    fn write_project_version(dir: &Path, contents: &str) {
+        fs::create_dir_all(dir.join("ProjectSettings")).unwrap();
+        fs::write(dir.join("ProjectSettings/ProjectVersion.txt"), contents).unwrap();
+    }
+
+    #[test]
+    fn unity_version_parses_typical_file() {
+        let tmp = Tempdir::new("uv-typical");
+        write_project_version(
+            tmp.path(),
+            "m_EditorVersion: 6000.2.7f2\nm_EditorVersionWithRevision: 6000.2.7f2 (abc)\n",
+        );
+        assert_eq!(unity_version(tmp.path()).unwrap(), "6000.2.7f2");
+    }
+
+    #[test]
+    fn unity_version_trims_surrounding_whitespace() {
+        let tmp = Tempdir::new("uv-ws");
+        write_project_version(tmp.path(), "m_EditorVersion:    6000.2.7f2   \n");
+        assert_eq!(unity_version(tmp.path()).unwrap(), "6000.2.7f2");
+    }
+
+    #[test]
+    fn unity_version_errors_when_file_missing() {
+        let tmp = Tempdir::new("uv-missing");
+        let err = unity_version(tmp.path()).unwrap_err();
+        assert_eq!(err.message, "Could not read Unity version");
+    }
+
+    #[test]
+    fn unity_version_errors_when_marker_line_missing() {
+        let tmp = Tempdir::new("uv-no-marker");
+        write_project_version(tmp.path(), "something-else: foo\n");
+        let err = unity_version(tmp.path()).unwrap_err();
+        assert_eq!(err.message, "Could not parse Unity version");
+    }
+
+    #[test]
+    fn prune_logs_keeps_n_newest_by_mtime() {
+        let tmp = Tempdir::new("prune-newest");
+        let names = [
+            "unity-2026-01-01T00-00-00Z.log",
+            "unity-2026-02-01T00-00-00Z.log",
+            "unity-2026-03-01T00-00-00Z.log",
+            "unity-2026-04-01T00-00-00Z.log",
+            "unity-2026-05-01T00-00-00Z.log",
+        ];
+        for (i, n) in names.iter().enumerate() {
+            // Older first: index 0 is oldest (5000s ago), index 4 is newest (1000s ago).
+            touch_with_age(&tmp.path().join(n), (5 - i as u64) * 1000);
+        }
+        prune_logs(tmp.path(), is_launch_log, 2);
+        for i in 0..3 {
+            assert!(!tmp.path().join(names[i]).exists(), "expected {} deleted", names[i]);
+        }
+        for i in 3..5 {
+            assert!(tmp.path().join(names[i]).exists(), "expected {} kept", names[i]);
+        }
+    }
+
+    // Regression test for the prefix-collision bug fix. Without is_launch_log's
+    // !starts_with("unity-auth-") guard, an old auth log would be pruned as a launch log.
+    #[test]
+    fn prune_launch_logs_does_not_touch_auth_logs() {
+        let tmp = Tempdir::new("prune-isolate");
+        let launch_logs: Vec<PathBuf> = (0..5)
+            .map(|i| {
+                let p = tmp.path().join(format!("unity-2026-0{}-01T00-00-00Z.log", i + 1));
+                touch_with_age(&p, (5 - i) * 1000);
+                p
+            })
+            .collect();
+        let auth_log = tmp.path().join("unity-auth-2026-01-01T00-00-00Z.log");
+        // Make auth log the oldest so a naive prefix-only matcher would delete it.
+        touch_with_age(&auth_log, 99999);
+
+        prune_logs(tmp.path(), is_launch_log, 2);
+
+        assert!(auth_log.exists(), "auth log must survive launch-log pruning");
+        let surviving = launch_logs.iter().filter(|p| p.exists()).count();
+        assert_eq!(surviving, 2);
+    }
+
+    #[test]
+    fn prune_logs_is_noop_under_cap() {
+        let tmp = Tempdir::new("prune-under");
+        for i in 0..3 {
+            touch_with_age(&tmp.path().join(format!("unity-2026-0{i}-01T00-00-00Z.log")), 100);
+        }
+        prune_logs(tmp.path(), is_launch_log, 10);
+        let count = fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(count, 3);
+    }
+}
