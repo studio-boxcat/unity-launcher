@@ -116,7 +116,9 @@ fn find_processes_impl(needle: &str, first_only: bool) -> Vec<libc::pid_t> {
         if bytes <= 0 {
             return vec![];
         }
-        let actual = bytes as usize / std::mem::size_of::<libc::pid_t>();
+        // proc_listallpids returns how many PIDs it wrote, not how many bytes. Clamp rather than
+        // trust it — unwritten slots stay 0 and are skipped below either way.
+        let actual = (bytes as usize).min(cap);
         pids.truncate(actual);
 
         let mut matches = vec![];
