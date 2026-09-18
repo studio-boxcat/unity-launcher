@@ -9,7 +9,7 @@ Targets **<10ms** on the "already running" fast path.
 
 ```sh
 just            # → bin/unity-launcher
-just install    # symlink to ~/.local/bin/unity-launcher
+just install    # cargo install into ~/.cargo/bin
 ```
 
 `bin/unity-launcher` is version-controlled so consumers can grab it without a

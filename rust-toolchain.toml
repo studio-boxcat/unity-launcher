@@ -1,0 +1,5 @@
+# Pinned so rustup installs it on first use.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

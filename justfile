@@ -6,11 +6,10 @@ build:
     mkdir -p bin
     cp target/release/unity-launcher bin/unity-launcher
 
-# Symlink ~/.local/bin/unity-launcher → bin/unity-launcher
-install: build
-    mkdir -p ~/.local/bin
-    ln -sf "{{justfile_directory()}}/bin/unity-launcher" ~/.local/bin/unity-launcher
-    @echo "→ ~/.local/bin/unity-launcher"
+# Install into ~/.cargo/bin the cargo way; the repo's target/ is the build cache. Machines that
+# do not develop this repo get the same binary from its git repo (config/setup.sh).
+install:
+    cargo install --path . --locked --force --target-dir target
 
 # Symlink ~/.config/unity-launcher/auth.sh → config/auth.sh.
 # credentials.env stays out of version control; populate it from credentials.env.example.
