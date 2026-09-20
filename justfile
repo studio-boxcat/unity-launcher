@@ -42,3 +42,7 @@ profile: build
 clean:
     cargo clean
     rm -rf bin
+
+# Compile without emitting — what `boxcat-devenv typecheck` runs for this repo.
+typecheck:
+    cargo check --all-targets
